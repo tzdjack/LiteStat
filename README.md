@@ -107,8 +107,8 @@ Copyright (c) 2026 tzdjack
 
 ## 致谢
 
-LiteStat 精简版版：https://github.com/tzdjack/MiniStat
+MiniStat 精简版：https://github.com/tzdjack/MiniStat
 
 ---
 
-**提示**：如需精简功能（如磁盘监控、电池状态、GPU 使用率等），请使用 [MiniStat 完整版](https://github.com/tzdjack/MiniStat)。
+**提示**：如需精简功能（如磁盘监控、电池状态、GPU 使用率等），请使用 [MiniStat 精简版](https://github.com/tzdjack/MiniStat)。
