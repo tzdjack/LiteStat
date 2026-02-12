@@ -1,4 +1,4 @@
-# LiteStat Lite
+# LiteStat
 
 一款超轻量级的 macOS 菜单栏系统监控工具。
 
