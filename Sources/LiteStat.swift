@@ -22,6 +22,14 @@ class Metrics {
     
     var prevTime: Date?
     var prevCPUTicks: [UInt64]?
+    
+    // 电源
+    var batteryPresent: Bool = false
+    var isCharging: Bool = false
+    var onAC: Bool = false
+    var powerW: Double = 0
+    var timeToEmptyMin: Int = -1
+    var timeToFullMin: Int = -1
 }
 
 // MARK: - 监控器
@@ -33,6 +41,44 @@ class Monitor {
         updateCPU()
         updateMemory()
         updateNetwork()
+        updatePower()
+    }
+
+    private func updatePower() {
+        // 检测是否有电池（台式机/无电池设备 list 为空）
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef],
+              !list.isEmpty else {
+            metrics.batteryPresent = false
+            metrics.powerW = 0
+            return
+        }
+        metrics.batteryPresent = true
+
+        // 读取 IOPS 提供的状态与时间（系统已计算）
+        for src in list {
+            guard let desc = IOPSGetPowerSourceDescription(info, src)?.takeUnretainedValue() as? [String: Any] else { continue }
+            let state = desc[kIOPSPowerSourceStateKey as String] as? String
+            metrics.onAC = (state != kIOPSBatteryPowerValue as String)
+            metrics.isCharging = (desc[kIOPSIsChargingKey as String] as? Bool) ?? false
+            if let t = desc[kIOPSTimeToEmptyKey as String] as? Int { metrics.timeToEmptyMin = t }
+            if let t = desc[kIOPSTimeToFullChargeKey as String] as? Int { metrics.timeToFullMin = t }
+            break
+        }
+
+        // 读 AppleSmartBattery 瞬时功率：mA × mV = μW → /1e6 = W
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return }
+        defer { IOObjectRelease(service) }
+
+        var amp = 0, volt = 0
+        if let a = IORegistryEntryCreateCFProperty(service, "InstantAmperage" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int { amp = a }
+        if let v = IORegistryEntryCreateCFProperty(service, "Voltage" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int { volt = v }
+
+        guard volt > 0 else { return }
+        let raw = Double(abs(amp)) * Double(volt) / 1_000_000.0
+        // EMA 平滑，避免每秒数字抖动
+        metrics.powerW = metrics.powerW == 0 ? raw : metrics.powerW * 0.7 + raw * 0.3
     }
 
     private func updateCPU() {
@@ -173,46 +219,73 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return String(format: "%.1fM", bps / (1024 * 1024))
     }
 
+    func formatDuration(_ minutes: Int) -> String {
+        guard minutes > 0 else { return "" }
+        let h = minutes / 60
+        let m = minutes % 60
+        return String(format: "%d:%02d", h, m)
+    }
+
     func updateMenuBarDisplay() {
         let m = monitor.metrics
-        
+
         // 格式化显示数据
         let downStr = formatSpeedCompact(m.netIn)
         let upStr = formatSpeedCompact(m.netOut)
         let cpuStr = String(format: "%3d", Int(m.cpu))
         let memStr = String(format: "%3d", Int(m.mem))
-        
+
         // 固定列宽对齐
         let col1Width = 8
         let downPad = String(repeating: " ", count: max(0, col1Width - downStr.count - 1))
         let upPad = String(repeating: " ", count: max(0, col1Width - upStr.count - 1))
-        
+
         let line1 = "\(downPad)\(downStr)↓ C:\(cpuStr)%"
         let line2 = "\(upPad)\(upStr)↑ M:\(memStr)%"
-        let menuText = "\(line1)\n\(line2)"
-        
+
+        var lines = [line1, line2]
+        // 第三行：电源信息（无电池设备不显示）
+        if m.batteryPresent {
+            let pStr = String(format: "%.1fW", m.powerW)
+            if m.isCharging {
+                // 充电：充电功率 + 预计充满时间
+                let tStr = m.timeToFullMin > 0 ? " 满\(formatDuration(m.timeToFullMin))" : ""
+                lines.append("⚡\(pStr)\(tStr)")
+            } else if m.onAC {
+                // 接电源但未充电：已充满
+                lines.append("⚡已充满")
+            } else {
+                // 放电：放电功率 + 预计待机时间
+                let tStr = m.timeToEmptyMin > 0 ? " \(formatDuration(m.timeToEmptyMin))" : ""
+                lines.append("⚡\(pStr)\(tStr)")
+            }
+        }
+
+        let menuText = lines.joined(separator: "\n")
+
         let attributedText = NSMutableAttributedString(string: menuText)
         let fullRange = NSRange(location: 0, length: (menuText as NSString).length)
-        
+
         // 使用8pt等宽字体
         let font = NSFont.monospacedSystemFont(ofSize: 8, weight: .regular)
         attributedText.addAttribute(.font, value: font, range: fullRange)
-        
-        // 设置行间距
+
+        // 设置行间距（三行时收紧以塞进菜单栏）
         let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.lineSpacing = 1
+        paragraphStyle.lineSpacing = lines.count > 2 ? 0 : 1
         attributedText.addAttribute(.paragraphStyle, value: paragraphStyle, range: fullRange)
-        
+
         // 将文本渲染为图像
         let textSize = attributedText.size()
-        let imageSize = NSSize(width: textSize.width, height: 22)
+        let imageHeight: CGFloat = lines.count > 2 ? 28 : 22
+        let imageSize = NSSize(width: textSize.width, height: imageHeight)
         let image = NSImage(size: imageSize, flipped: false) { rect in
             let yOffset = (rect.height - textSize.height) / 2 + 1
             attributedText.draw(at: NSPoint(x: 0, y: yOffset))
             return true
         }
         image.isTemplate = true
-        
+
         statusItem.button?.image = image
         statusItem.button?.imagePosition = .imageOnly
     }
