@@ -82,13 +82,26 @@ class Monitor {
         if let c = IORegistryEntryCreateCFProperty(service, "AppleRawCurrentCapacity" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int { curMAh = c }
 
         guard volt > 0 else { return }
-        let raw = Double(abs(amp)) * Double(volt) / 1_000_000.0
-        // EMA 平滑，避免每秒数字抖动；用独立标志判断首次，避免零功率被反复重置
+        // 计算当前功耗：
+        // - 插电时：整机功耗 = SystemPowerIn - 电池充电功率（SystemPowerIn 为电源适配器实际输出）
+        // - 放电时：电池放电功率 = |InstantAmperage| × Voltage
+        let raw: Double
+        if let telemetry = IORegistryEntryCreateCFProperty(service, "PowerTelemetryData" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? [String: Any],
+           let systemPowerIn = telemetry["SystemPowerIn"] as? Int,
+           let batteryPower = telemetry["BatteryPower"] as? Int,
+           systemPowerIn > 0 {
+            // 插电：整机功耗 = 系统输入功率 - 电池充电功率（单位 mW → W）
+            raw = Double(systemPowerIn - abs(batteryPower)) / 1000.0
+        } else {
+            // 放电：电池放电功率 = |电流| × 电压（mA × mV = μW → /1e6 = W）
+            raw = Double(abs(amp)) * Double(volt) / 1_000_000.0
+        }
+        // EMA 平滑，权重 0.5 让功耗更灵敏地跟随实际变化
         if !metrics.powerWInitialized {
             metrics.powerW = raw
             metrics.powerWInitialized = true
         } else {
-            metrics.powerW = metrics.powerW * 0.7 + raw * 0.3
+            metrics.powerW = metrics.powerW * 0.5 + raw * 0.5
         }
 
         // 实际充电状态修正：当系统报告不在充电但电流为正（流入电池）时，
