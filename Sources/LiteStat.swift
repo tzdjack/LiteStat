@@ -25,9 +25,11 @@ class Metrics {
     
     // 电源
     var batteryPresent: Bool = false
+    var batteryPercent: Int = 0
     var isCharging: Bool = false
     var onAC: Bool = false
     var powerW: Double = 0
+    var powerWInitialized: Bool = false
     var timeToEmptyMin: Int = -1
     var timeToFullMin: Int = -1
 }
@@ -56,12 +58,15 @@ class Monitor {
         metrics.batteryPresent = true
 
         // 读取 IOPS 提供的状态与时间（系统已计算）
+        var systemTimeToEmpty: Int?
         for src in list {
             guard let desc = IOPSGetPowerSourceDescription(info, src)?.takeUnretainedValue() as? [String: Any] else { continue }
             let state = desc[kIOPSPowerSourceStateKey as String] as? String
             metrics.onAC = (state != kIOPSBatteryPowerValue as String)
             metrics.isCharging = (desc[kIOPSIsChargingKey as String] as? Bool) ?? false
-            if let t = desc[kIOPSTimeToEmptyKey as String] as? Int { metrics.timeToEmptyMin = t }
+            metrics.batteryPercent = (desc[kIOPSCurrentCapacityKey as String] as? Int) ?? 0
+            systemTimeToEmpty = desc[kIOPSTimeToEmptyKey as String] as? Int
+            if let t = systemTimeToEmpty { metrics.timeToEmptyMin = t }
             if let t = desc[kIOPSTimeToFullChargeKey as String] as? Int { metrics.timeToFullMin = t }
             break
         }
@@ -71,14 +76,36 @@ class Monitor {
         guard service != 0 else { return }
         defer { IOObjectRelease(service) }
 
-        var amp = 0, volt = 0
+        var amp = 0, volt = 0, curMAh = 0
         if let a = IORegistryEntryCreateCFProperty(service, "InstantAmperage" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int { amp = a }
         if let v = IORegistryEntryCreateCFProperty(service, "Voltage" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int { volt = v }
+        if let c = IORegistryEntryCreateCFProperty(service, "AppleRawCurrentCapacity" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Int { curMAh = c }
 
         guard volt > 0 else { return }
         let raw = Double(abs(amp)) * Double(volt) / 1_000_000.0
-        // EMA 平滑，避免每秒数字抖动
-        metrics.powerW = metrics.powerW == 0 ? raw : metrics.powerW * 0.7 + raw * 0.3
+        // EMA 平滑，避免每秒数字抖动；用独立标志判断首次，避免零功率被反复重置
+        if !metrics.powerWInitialized {
+            metrics.powerW = raw
+            metrics.powerWInitialized = true
+        } else {
+            metrics.powerW = metrics.powerW * 0.7 + raw * 0.3
+        }
+
+        // 实际充电状态修正：当系统报告不在充电但电流为正（流入电池）时，
+        // 说明有第三方工具（如 AlDente）接管了充电控制，按实际电流方向判定
+        if !metrics.isCharging && amp > 100 {
+            metrics.isCharging = true
+        }
+
+        // 若系统未提供待机时间估算（macOS 常返回 no estimate），则自行估算
+        // 公式：剩余能量(Wh) = 当前容量(mAh) × 电压(V) / 1000
+        //      剩余时间(h) = 剩余能量(Wh) / 放电功率(W)
+        let hasSystemEstimate = (systemTimeToEmpty ?? -1) > 0
+        if !metrics.onAC && !hasSystemEstimate && curMAh > 0 && metrics.powerW > 0.1 {
+            let energyWh = Double(curMAh) * Double(volt) / 1_000_000.0
+            let estHours = energyWh / metrics.powerW
+            metrics.timeToEmptyMin = Int(estHours * 60)
+        }
     }
 
     private func updateCPU() {
@@ -126,31 +153,25 @@ class Monitor {
 
         let now = Date()
         var totalIn: UInt64 = 0, totalOut: UInt64 = 0
-        var cur = first
+        var cur: UnsafeMutablePointer<ifaddrs>? = first
 
-        while true {
-            let iface = cur.pointee
+        while let ptr = cur {
+            let iface = ptr.pointee
             let name = String(cString: iface.ifa_name)
 
-            if name == "lo0" {
-                guard let next = iface.ifa_next else { break }
-                cur = next
-                continue
-            }
-
-            if iface.ifa_addr.pointee.sa_family == UInt8(AF_LINK),
+            // 仅监控物理网卡：macOS 上 WiFi 与有线网卡均为 en* 命名
+            // 过滤 lo0/awdl0/llw0/utun/gif/stf/bridge 等虚拟/隧道接口
+            if name.hasPrefix("en"),
+               let addr = iface.ifa_addr,
+               addr.pointee.sa_family == UInt8(AF_LINK),
                let data = iface.ifa_data?.assumingMemoryBound(to: if_data.self) {
                 let bytesIn = UInt64(data.pointee.ifi_ibytes)
                 let bytesOut = UInt64(data.pointee.ifi_obytes)
-
-                if bytesIn > 0 || bytesOut > 0 {
-                    totalIn += bytesIn
-                    totalOut += bytesOut
-                }
+                totalIn += bytesIn
+                totalOut += bytesOut
             }
 
-            guard let next = iface.ifa_next else { break }
-            cur = next
+            cur = iface.ifa_next
         }
 
         if let pt = metrics.prevTime {
@@ -177,8 +198,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var menu: NSMenu!
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
         if let btn = statusItem.button {
@@ -214,16 +233,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func formatSpeedCompact(_ bps: Double) -> String {
-        if bps < 1024 { return String(format: "%.0fB/s", bps) }
+        if bps < 1024 { return String(format: "%.0fB", bps) }
         if bps < 1024 * 1024 { return String(format: "%.1fK", bps / 1024) }
-        return String(format: "%.1fM", bps / (1024 * 1024))
+        if bps < 1024 * 1024 * 1024 { return String(format: "%.1fM", bps / (1024 * 1024)) }
+        return String(format: "%.2fG", bps / (1024 * 1024 * 1024))
     }
 
-    func formatDuration(_ minutes: Int) -> String {
+    /// 计算字符串在等宽字体下的显示宽度（ASCII 字符宽度为 1，中文字符宽度为 2）
+    func displayWidth(_ s: String) -> Int {
+        var w = 0
+        for c in s.unicodeScalars {
+            if c.value <= 0x7F {
+                w += 1
+            } else {
+                w += 2
+            }
+        }
+        return w
+    }
+
+    /// 将分钟数格式化为小时数，智能调整精度以控制宽度：
+    /// - <100h → 一位小数（如 8.5）
+    /// - ≥100h 且 ≤999h → 整数（如 120）
+    /// - >999h → 固定显示 999（上限保护）
+    /// 输出宽度：最多 3 字符（个位数小数 3 字符，三位数整数 3 字符）
+    func formatDurationHours(_ minutes: Int) -> String {
         guard minutes > 0 else { return "" }
-        let h = minutes / 60
-        let m = minutes % 60
-        return String(format: "%d:%02d", h, m)
+        let hours = Double(minutes) / 60.0
+        if hours >= 999 {
+            return "999"
+        } else if hours >= 100 {
+            return String(format: "%.0f", hours)
+        } else {
+            return String(format: "%.1f", hours)
+        }
     }
 
     func updateMenuBarDisplay() {
@@ -245,20 +288,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         var lines = [line1, line2]
         // 第三行：电源信息（无电池设备不显示）
+        // 简化逻辑：放电 → 待机时间；插电/充电 → 无限符号 ∞
         if m.batteryPresent {
+            // 左侧：功率+W，8字符右对齐（与网速列对齐）
             let pStr = String(format: "%.1fW", m.powerW)
-            if m.isCharging {
-                // 充电：充电功率 + 预计充满时间
-                let tStr = m.timeToFullMin > 0 ? " 满\(formatDuration(m.timeToFullMin))" : ""
-                lines.append("⚡\(pStr)\(tStr)")
-            } else if m.onAC {
-                // 接电源但未充电：已充满
-                lines.append("⚡已充满")
+            let powerPad = String(repeating: " ", count: max(0, col1Width - pStr.count))
+            let powerAligned = "\(powerPad)\(pStr)"
+
+            // 右侧：放电显示待机时间，插电/充电显示 INF（无限续航）
+            let rightStr: String
+            if m.isCharging || m.onAC {
+                rightStr = "INF"
             } else {
-                // 放电：放电功率 + 预计待机时间
-                let tStr = m.timeToEmptyMin > 0 ? " \(formatDuration(m.timeToEmptyMin))" : ""
-                lines.append("⚡\(pStr)\(tStr)")
+                rightStr = m.timeToEmptyMin > 0 ? formatDurationHours(m.timeToEmptyMin) : ""
             }
+            let rightPad = String(repeating: " ", count: max(0, 4 - displayWidth(rightStr)))
+            let rightAligned = "\(rightPad)\(rightStr)"
+
+            lines.append("\(powerAligned) H:\(rightAligned)")
         }
 
         let menuText = lines.joined(separator: "\n")
@@ -326,34 +373,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - 系统休眠/锁屏处理
-    
-    private var wasUpdatingBeforeSleep = false
-    
+
+    /// 用户是否希望监控运行（独立于 timer 的实际状态，避免 sleep 与 session 事件互相覆盖）
+    private var wantsTimer: Bool = true
+
+    /// 启动定时器（若尚未运行）
+    private func startTimerIfNeeded() {
+        guard timer == nil || !(timer?.isValid ?? false) else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.update() }
+        timer?.tolerance = 0.05
+        update()
+    }
+
+    /// 停止定时器
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
     @objc func systemWillSleep() {
-        wasUpdatingBeforeSleep = timer?.isValid ?? false
-        timer?.invalidate()
-        timer = nil
+        // 休眠时停止 timer，但不改变 wantsTimer，以便唤醒后恢复
+        stopTimer()
     }
-    
+
     @objc func systemDidWake() {
-        if wasUpdatingBeforeSleep {
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.update() }
-            timer?.tolerance = 0.05
-            update()
-        }
+        if wantsTimer { startTimerIfNeeded() }
     }
-    
+
     @objc func sessionDidResignActive() {
-        timer?.invalidate()
-        timer = nil
+        wantsTimer = false
+        stopTimer()
     }
-    
+
     @objc func sessionDidBecomeActive() {
-        if timer == nil || !(timer?.isValid ?? false) {
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.update() }
-            timer?.tolerance = 0.05
-            update()
-        }
+        wantsTimer = true
+        startTimerIfNeeded()
     }
 
     static func main() {
@@ -361,6 +415,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let delegate = AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
-        app.run()
+        // NSApplication.delegate 是 weak 引用，需保证 delegate 在 run() 期间存活
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
     }
 }
