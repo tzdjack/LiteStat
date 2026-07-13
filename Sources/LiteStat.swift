@@ -30,6 +30,7 @@ class Metrics {
     var onAC: Bool = false
     var powerW: Double = 0
     var powerWInitialized: Bool = false
+    var batteryChargePower: Double = 0  // 电池充电功率（W），插电时有效
     var timeToEmptyMin: Int = -1
     var timeToFullMin: Int = -1
 }
@@ -92,9 +93,12 @@ class Monitor {
            systemPowerIn > 0 {
             // 插电：整机功耗 = 系统输入功率 - 电池充电功率（单位 mW → W）
             raw = Double(systemPowerIn - abs(batteryPower)) / 1000.0
+            // 存储充电功率（单位 mW → W），用于插电时显示
+            metrics.batteryChargePower = Double(abs(batteryPower)) / 1000.0
         } else {
             // 放电：电池放电功率 = |电流| × 电压（mA × mV = μW → /1e6 = W）
             raw = Double(abs(amp)) * Double(volt) / 1_000_000.0
+            metrics.batteryChargePower = 0
         }
         // EMA 平滑，权重 0.5 让功耗更灵敏地跟随实际变化
         if !metrics.powerWInitialized {
@@ -301,24 +305,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         var lines = [line1, line2]
         // 第三行：电源信息（无电池设备不显示）
-        // 简化逻辑：放电 → 待机时间；插电/充电 → 无限符号 ∞
+        // 插电 → 显示充电功率；放电 → 显示待机时间
         if m.batteryPresent {
             // 左侧：功率+W，8字符右对齐（与网速列对齐）
             let pStr = String(format: "%.1fW", m.powerW)
             let powerPad = String(repeating: " ", count: max(0, col1Width - pStr.count))
             let powerAligned = "\(powerPad)\(pStr)"
 
-            // 右侧：放电显示待机时间，插电/充电显示 INF（无限续航）
+            // 右侧：插电显示充电功率，放电显示待机时间
             let rightStr: String
+            let label: String
             if m.isCharging || m.onAC {
-                rightStr = "INF"
+                // 插电时显示充电功率（P: 代表功率）
+                label = "P:"
+                let chargeW = m.batteryChargePower
+                if chargeW >= 100 {
+                    rightStr = String(format: "%.0f", chargeW)
+                } else if chargeW >= 1 {
+                    rightStr = String(format: "%.1f", chargeW)
+                } else if chargeW > 0 {
+                    rightStr = String(format: "%.1f", chargeW)
+                } else {
+                    rightStr = "0.0"
+                }
             } else {
+                // 放电时显示待机时间（H: 代表小时）
+                label = "H:"
                 rightStr = m.timeToEmptyMin > 0 ? formatDurationHours(m.timeToEmptyMin) : ""
             }
             let rightPad = String(repeating: " ", count: max(0, 4 - displayWidth(rightStr)))
             let rightAligned = "\(rightPad)\(rightStr)"
 
-            lines.append("\(powerAligned) H:\(rightAligned)")
+            lines.append("\(powerAligned) \(label)\(rightAligned)")
         }
 
         let menuText = lines.joined(separator: "\n")
